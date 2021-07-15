@@ -1,5 +1,6 @@
 package com.transloadit.sdk;
 
+import com.transloadit.sdk.async.UploadProgressListener;
 import com.transloadit.sdk.exceptions.LocalOperationException;
 import com.transloadit.sdk.exceptions.RequestException;
 import com.transloadit.sdk.response.AssemblyResponse;
@@ -9,11 +10,9 @@ import io.socket.emitter.Emitter;
 import io.socket.engineio.client.transports.WebSocket;
 import io.tus.java.client.ProtocolException;
 import io.tus.java.client.TusClient;
-import io.tus.java.client.TusExecutor;
 import io.tus.java.client.TusURLMemoryStore;
 import io.tus.java.client.TusURLStore;
 import io.tus.java.client.TusUpload;
-import io.tus.java.client.TusUploader;
 import org.json.JSONObject;
 
 import java.io.File;
@@ -27,6 +26,12 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadPoolExecutor;
+
+// CHECKSTYLE:OFF
+import io.tus.java.client.TusUploader;
+// CHECKTYLE:ON
 
 /**
  * This class represents a new assembly being created.
@@ -40,6 +45,17 @@ public class Assembly extends OptionsBuilder {
     protected List<TusUpload> uploads;
     protected boolean shouldWaitForCompletion;
     protected AssemblyListener assemblyListener;
+
+
+    private ArrayList<TusUploadThread> threadList;
+    private HashMap<String, Exception> threadExceptions;
+    private int maxParallelUploads = 2;
+    private ThreadPoolExecutor executor;
+
+    private long uploadSize;
+    private long uploadedBytes;
+    private UploadProgressListener uploadProgressListener;
+    protected int uploadChunkSize = 0;
 
     /**
      * Calls {@link #Assembly(Transloadit, Steps, Map, Map)} with the transloadit client as parameter.
@@ -66,6 +82,8 @@ public class Assembly extends OptionsBuilder {
         uploads = new ArrayList<TusUpload>();
         fileStreams = new HashMap<String, InputStream>();
         shouldWaitForCompletion = false;
+        threadList =  new ArrayList<TusUploadThread>();
+        threadExceptions = new HashMap<String, Exception>();
     }
 
     /**
@@ -335,6 +353,7 @@ public class Assembly extends OptionsBuilder {
      * @param assemblyUrl the assembly url affiliated with the tus upload.
      * @throws IOException when there's a failure with file retrieval.
      */
+
     protected void processTusFile(File file, String fieldName, String assemblyUrl) throws IOException {
         TusUpload upload = getTusUploadInstance(file);
 
@@ -379,30 +398,72 @@ public class Assembly extends OptionsBuilder {
     }
 
     /**
+     * Calculates the expected uploadSize in Bytes.
+     * @return the expected cumulative upload size
+     * @throws IOException Input Streams cannote be read
+     */
+    public long getUploadSize() throws IOException {
+        long totalUploadSize = 0;
+        for (Map.Entry<String, File> entry : files.entrySet()) {
+            totalUploadSize += entry.getValue().length();
+        }
+
+        for (Map.Entry<String, InputStream> entry : fileStreams.entrySet()) {
+            totalUploadSize += entry.getValue().available();
+        }
+        return totalUploadSize;
+    }
+
+    /**
      * Does the actual uploading of files (when tus is enabled).
      *
      * @throws IOException when there's a failure with file retrieval.
      * @throws ProtocolException when there's a failure with tus upload.
      */
     protected void uploadTusFiles() throws IOException, ProtocolException {
-        while (uploads.size() > 0) {
-            final TusUploader tusUploader = tusClient.resumeOrCreateUpload(uploads.get(0));
-
-            TusExecutor tusExecutor = new TusExecutor() {
+        if (uploadProgressListener == null) {
+            uploadProgressListener = new UploadProgressListener() {
                 @Override
-                protected void makeAttempt() throws ProtocolException, IOException {
-                    int uploadedChunk = 0;
-                    while (uploadedChunk > -1) {
-                        uploadedChunk = tusUploader.uploadChunk();
-                    }
-                    tusUploader.finish();
+                public void onUploadFinished() {
+
+                }
+
+                @Override
+                public void onUploadProgress(long uploadedBytes, long totalBytes) {
+
+                }
+
+                @Override
+                public void onUploadFailed(Exception exception) {
+
+                }
+
+                @Override
+                public void onParallelUploadsStarting(int parallelUploads, int uploadNumber) {
+
+                }
+
+                @Override
+                public void onParallelUploadsPaused(String name) {
+
+                }
+
+                @Override
+                public void onParallelUploadsResumed(String name) {
+
                 }
             };
-
-            tusExecutor.makeAttempts();
-            // remove upload instance from list
-            uploads.remove(0);
         }
+        uploadSize = getUploadSize();
+        executor = (ThreadPoolExecutor) Executors.newFixedThreadPool(maxParallelUploads);
+        uploadProgressListener.onParallelUploadsStarting(maxParallelUploads,uploads.size());
+        while (uploads.size() > 0) {
+            final TusUpload  tusUpload = uploads.remove(0);
+            TusUploadThread tusUploadThread = new TusUploadThread(tusClient, tusUpload, uploadChunkSize, this);
+            threadList.add(tusUploadThread);
+            executor.execute(tusUploadThread);
+        }
+        executor.shutdown();
     }
 
     /**
@@ -550,4 +611,134 @@ public class Assembly extends OptionsBuilder {
 
         return response;
     }
+
+    /**
+     * Returns the uploadChunkSize which is used to determine after how many bytes upload should the
+     * {@link UploadProgressListener#onUploadProgress(long, long)} callback be triggered.
+     *
+     * @return uploadChunkSize
+     */
+    public int getUploadChunkSize() {
+        return uploadChunkSize;
+    }
+
+    /**
+     * Sets the uploadChunkSize which is used to determine after how many bytes upload should the
+     * {@link UploadProgressListener#onUploadProgress(long, long)} callback be triggered. If not set,
+     * or if given the value of 0, the default set by {@link TusUploader} will be used internally.
+     *
+     * @param uploadChunkSize the upload chunk size in bytes after which you want to receive an upload progress
+     */
+    public void setUploadChunkSize(int uploadChunkSize) {
+        this.uploadChunkSize = uploadChunkSize;
+    }
+
+    /**
+     * This method sets how many uploads are performed simultaneously. If the number of uploads exceeds the set value,
+     * a queue is created and processed piece by piece.
+     * @param maxUploads maximum number of uploads, which are performed simultaneously.
+     */
+    public void setMaxParallelUploads(int maxUploads) {
+        this.maxParallelUploads = maxUploads;
+    }
+
+
+    /**
+     * Returns current UploadProgressListener.
+     * @return {@link UploadProgressListener}
+     */
+    public UploadProgressListener getUploadProgressListener() {
+        return uploadProgressListener;
+    }
+
+    /**
+     * This methods sets a customised {@link UploadProgressListener}.
+     * @param uploadProgressListener {@link UploadProgressListener}
+     */
+    public void setUploadProgressListener(UploadProgressListener uploadProgressListener) {
+        this.uploadProgressListener = uploadProgressListener;
+    }
+    /**
+     * This Method is used to pause parallel File uploads.
+     */
+    public void pauseUploads() throws LocalOperationException {
+        for (TusUploadThread thread : threadList) {
+            thread.setPaused();
+        }
+    }
+
+    /**
+     * This Method is used to pause parallel File uploads.
+     */
+    public void resumeUploads() throws LocalOperationException, RequestException {
+        for (TusUploadThread thread : threadList) {
+            thread.setUnPaused();
+        }
+    }
+
+    /**
+     * This Method is used to abort all parallel File uploads.
+     * It informs the current {@link UploadProgressListener} about the abortion.
+     */
+    protected void abortUploads() {
+        executor.shutdownNow();
+        uploadProgressListener.onUploadFailed(new LocalOperationException("Uploads aborted"));
+    }
+
+    /**
+     * This Method is used to abort all parallel File uploads.
+     * It informs the current {@link UploadProgressListener} about the abortion.
+     * @param e {@link Exception that lead to the abortion}
+     */
+    protected void abortUploads(Exception e) {
+        executor.shutdownNow();
+        uploadProgressListener.onUploadFailed(e);
+    }
+
+    /**
+     * This method removes finished Threads from the ThreadList.
+     * @param tusUploadThread a Upload Thread instance
+     */
+    synchronized void removeThreadFromList(TusUploadThread tusUploadThread) {
+        threadList.remove(tusUploadThread);
+    }
+
+    /**
+     * Updates the number of Bytes, which have been uploaded already.
+     * Also triggers Upload finished if the uploads has been finished.
+     * @param uploadedBytes Number of bytes uploaded by the calling Thread.
+     */
+    protected synchronized void updateUploadProgress(long uploadedBytes) {
+        this.uploadedBytes += uploadedBytes;
+        uploadProgressListener.onUploadProgress(this.uploadedBytes, uploadSize);
+        if (this.uploadedBytes == uploadSize) {
+            uploadProgressListener.onUploadFinished();
+        }
+    }
+
+    /**
+     * Takes a {@link LocalOperationException} from a running thread and stores it in {@link #threadExceptions}.
+     * Also stops the uploads and notifies the user.
+     * @param s Thread Name
+     * @param e {@link LocalOperationException}
+     */
+     protected void threadThrowsLocalOperationException(String s, Exception e) {
+        this.threadExceptions.put(s, new LocalOperationException(e));
+         abortUploads(e);
+    }
+
+    /**
+     * /**
+     * Takes a {@link RequestException} from a running thread and stores it in {@link #threadExceptions}.
+     * Also stops the uploads and notifies the user.
+     * @param s Thread Name
+     * @param e {@link RequestException}
+     */
+     protected void threadThrowsRequestException(String s, Exception e) {
+         this.threadExceptions.put(s, new LocalOperationException(e));
+         abortUploads(e);
+    }
+
+
+
 }
